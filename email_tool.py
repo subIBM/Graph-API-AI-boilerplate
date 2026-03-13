@@ -146,11 +146,15 @@ def build_master_excel(default_impl_status: str = "Pending") -> pd.DataFrame | N
 
     # Atomic write: write to a temp file then rename
     master_path = os.path.join(EXCELS_FOLDER, "master_patch_data.xlsx")
-    tmp_path    = master_path + ".tmp"
-
+    # tmp_path    = master_path + ".tmp"
     with _excel_lock:
-        master_df.to_excel(tmp_path, index=False)
-        os.replace(tmp_path, master_path)
+        master_df.to_excel(master_path, index=False)
+        print(f"Master Excel updated: {master_path}")
+ 
+
+    # with _excel_lock:
+    #     master_df.to_excel(tmp_path, index=False)
+    #     os.replace(tmp_path, master_path)
 
     logger.info("Master Excel rebuilt — %d unique servers → %s", len(master_df), master_path)
     return master_df
