@@ -43,7 +43,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
+EXCELS_FOLDER  :str=os.environ["EXCELS_FOLDER"]
 FOLDER_NAME    : str = os.environ["FOLDER_NAME"]
 WEBHOOK_URL    : str = os.environ["WEBHOOK_URL"]
 PROCESSED_FILE : str = os.environ.get("PROCESSED_FILE", "processed_ids.txt")
@@ -132,29 +132,82 @@ def webhook():
     return jsonify({"status": "ok"}), 200
 
 
-def _handle_new_mail_notification(message_id: str) -> None:
-    """
-    Background task: run the agent in response to a new mail notification.
+def _get_message_subject(message_id: str) -> str:
+    """Fetch just the subject of a message directly from Graph API."""
+    try:
+        url  = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}?$select=subject"
+        resp = requests.get(url, headers=get_headers(), timeout=15)
+        resp.raise_for_status()
+        return resp.json().get("subject", "")
+    except Exception as exc:
+        logger.warning("Could not fetch subject for %s: %s", message_id, exc)
+        return ""
 
-    Args:
-        message_id: Graph API message ID (used only for logging here;
-                    the agent fetches the full email via get_latest_mail).
-    """
+
+# def _handle_new_mail_notification(message_id: str) -> None:
+#     """
+#     Background task: run the agent in response to a new mail notification.
+
+#     Args:
+#         message_id: Graph API message ID (used only for logging here;
+#                     the agent fetches the full email via get_latest_mail).
+#     """
+#     logger.info("Processing notification for message: %s", message_id)
+
+#     query = (
+#         "A new patching email just arrived. "
+#         "Fetch the latest email and check if its subject contains "
+#         "'Maintenance Notification', 'Reschedule Maintenance', or 'Implementation Status'. "
+#         "If it does, download any Excel attachments and summarise the Lyric servers "
+#         "found in the updated data, including their patch windows and reboot requirements."
+#     )
+
+#     try:
+#         result = run_agent(query, stream=False)
+#         logger.info("\n[Agent Auto-Response]\n%s", result)
+#     except Exception as exc:
+#         logger.error("Agent failed while handling notification %s: %s", message_id, exc)
+
+
+def _handle_new_mail_notification(message_id: str) -> None:
     logger.info("Processing notification for message: %s", message_id)
 
-    query = (
-        "A new patching email just arrived. "
-        "Fetch the latest email and check if its subject contains "
-        "'Maintenance Notification', 'Reschedule Maintenance', or 'Implementation Status'. "
-        "If it does, download any Excel attachments and summarise the Lyric servers "
-        "found in the updated data, including their patch windows and reboot requirements."
-    )
+    subject = _get_message_subject(message_id)
+    logger.info("Mail subject: %s", subject)
+
+    if "Implementation Status" in subject:
+        query = (
+            "A new Implementation Status email just arrived. "
+            "Fetch the latest email from the Enterprise Patching folder and "
+            "download/Save any Excel attachments."
+        )
+    elif "Reschedule Maintenance" in subject:
+        query = (
+            "A new Reschedule Maintenance email just arrived. "
+            "Fetch the latest email, download any Excel attachments, and summarise "
+            "the Lyric servers found in the updated data, including their patch windows "
+            "and reboot requirements."
+        )
+    elif "Maintenance Notification" in subject:
+        query = (
+            "A new Maintenance Notification email just arrived. "
+            "Fetch the latest email, download any Excel attachments, and summarise "
+            "the Lyric servers found in the updated data, including their patch windows "
+            "and reboot requirements."
+        )
+    else:
+        logger.info(
+            "Subject '%s' does not match any known category — skipping agent.", subject
+        )
+        return
 
     try:
         result = run_agent(query, stream=False)
         logger.info("\n[Agent Auto-Response]\n%s", result)
     except Exception as exc:
-        logger.error("Agent failed while handling notification %s: %s", message_id, exc)
+        logger.error(
+            "Agent failed while handling notification %s: %s", message_id, exc
+        )
 
 
 
@@ -281,6 +334,7 @@ def renew_subscription() -> None:
 
 
 if __name__ == "__main__":
+    os.makedirs(EXCELS_FOLDER, exist_ok=True)
     # Start subscription setup in background so Flask binds first
     threading.Thread(target=setup_subscription, daemon=True).start()
 
