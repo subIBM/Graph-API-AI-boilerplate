@@ -2,6 +2,7 @@
 token_cache.bin
 processed_ids.txt
 response.json
+*.pkl
 
 folder_ids.txt
 details.txt
