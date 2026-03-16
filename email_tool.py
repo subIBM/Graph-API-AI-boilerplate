@@ -1,5 +1,5 @@
 """
-
+email_tool.py
 -------------
 All executable tool functions and their Groq-compatible JSON schemas.
 
@@ -19,6 +19,28 @@ Sections:
     4. Mail tools          (fetch latest, search by subject)
     5. TOOL_REGISTRY
     6. TOOL_SCHEMAS
+
+Key behaviour — Implementation Status mails
+--------------------------------------------
+Each Implementation Status mail covers a DIFFERENT subset of servers.
+To avoid overwriting earlier servers when a new mail arrives we:
+
+  * Save every Implementation Status attachment with a UNIQUE timestamped
+    filename  (implementation_<YYYYMMDD_HHMMSS>.xlsx)  instead of always
+    writing to 'implementation_latest.xlsx'.  All files accumulate in the
+    ImplementationStatus/ sub-folder.
+
+  * build_master_excel() reads ALL files in ImplementationStatus/ and
+    merges them together before deduplication, so every batch of servers
+    is always present in the master.
+
+  * Maintenance and Rescheduled still use a single 'latest' file because
+    those mails replace each other by design (most-recent wins).
+
+  * The master rebuild NEVER touches the 'Boot Time',
+    'Application Team Validation Status', or 'Error' columns that the
+    Validation Agent has already written.  Those columns are preserved by
+    a merge-with-existing-master step inside build_master_excel().
 """
 
 from __future__ import annotations
@@ -38,7 +60,6 @@ import requests
 from dotenv import load_dotenv
 
 from auth import get_headers
-
 from validation_agent import run_agent as run_validation_agent
 
 load_dotenv()
@@ -57,10 +78,21 @@ IMPORTANT_COLUMNS: list[str] = [
     "Implementation Status",
 ]
 
-# Sub-folder priority: higher number wins on deduplication
+# Columns written exclusively by the Validation Agent.
+# build_master_excel() NEVER overwrites these — it carries them forward
+# from the existing master so previous run data is never lost.
+_VALIDATION_COLUMNS: list[str] = [
+    "Boot Time",
+    "Error",
+    "Application Team Validation Status",
+]
+
+# Sub-folder priority: higher number wins on deduplication across folders.
+# Within ImplementationStatus itself ALL files are merged (no dedup needed
+# until the combined frame is deduped against Maintenance/Rescheduled).
 _SUBFOLDER_PRIORITY: dict[str, int] = {
-    "Maintenance":        1,
-    "Rescheduled":        2,
+    "Maintenance":          1,
+    "Rescheduled":          2,
     "ImplementationStatus": 3,
 }
 
@@ -72,15 +104,13 @@ for _sub in _SUBFOLDER_PRIORITY:
 _excel_lock: threading.Lock = threading.Lock()
 
 
+# ---------------------------------------------------------------------------
 # Content-based mail dedup
 # ---------------------------------------------------------------------------
- 
-# In-memory set — prevents duplicate Graph notifications (same physical email,
-# different message_id) from being processed more than once per process lifetime.
-# On restart this resets, but Graph's retry window (~4 hrs) makes that low-risk
-# for a stable server. Add disk persistence if restarts are frequent.
+
 _processed_mail_hashes: set[str] = set()
 _mail_hash_lock: threading.Lock  = threading.Lock()
+
 
 def _make_mail_hash(subject: str, received: str, sender: str) -> str:
     """
@@ -92,6 +122,9 @@ def _make_mail_hash(subject: str, received: str, sender: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# Excel helpers
+# ---------------------------------------------------------------------------
 
 def _get_latest_file(folder: str) -> Path | None:
     """Return the most-recently-modified Excel/CSV file in *folder*, or None."""
@@ -100,6 +133,15 @@ def _get_latest_file(folder: str) -> Path | None:
         if f.is_file() and f.suffix.lower() in EXCEL_EXTENSIONS
     ]
     return max(candidates, key=lambda f: f.stat().st_mtime) if candidates else None
+
+
+def _get_all_files(folder: str) -> list[Path]:
+    """Return ALL Excel/CSV files in *folder*, sorted oldest → newest."""
+    candidates = [
+        f for f in Path(folder).iterdir()
+        if f.is_file() and f.suffix.lower() in EXCEL_EXTENSIONS
+    ]
+    return sorted(candidates, key=lambda f: f.stat().st_mtime)
 
 
 def _read_file(path: Path) -> pd.DataFrame:
@@ -111,17 +153,31 @@ def _read_file(path: Path) -> pd.DataFrame:
 
 def build_master_excel(default_impl_status: str = "Pending") -> pd.DataFrame | None:
     """
-    Merge the latest file from each sub-folder into a single master Excel.
+    Merge source files from all sub-folders into a single master Excel.
 
-    Deduplication:
-        Rows are deduplicated on 'Server Name'.
-        The sub-folder with the highest priority wins (ImplementationStatus > Rescheduled > Maintenance).
+    Implementation Status folder
+    ----------------------------
+    ALL files in ImplementationStatus/ are read and stacked — this is how
+    servers from multiple emails coexist without overwriting each other.
 
-    The resulting file is written atomically (temp-file + rename) to avoid
-    partial reads if another thread loads while we are writing.
+    Maintenance / Rescheduled folders
+    ----------------------------------
+    Only the latest file is read (most-recent-wins for these mail types).
 
-    Args:
-        default_impl_status: Value to fill when 'Implementation Status' is absent.
+    Deduplication
+    -------------
+    Rows are deduplicated on 'Server Name'.
+    Higher-priority sub-folder wins (ImplementationStatus > Rescheduled > Maintenance).
+    Within ImplementationStatus, the LAST occurrence of a server (newest file)
+    wins — handles the rare case of the same server appearing in two mails.
+
+    Validation data preservation
+    ----------------------------
+    After rebuilding from source files the function loads the existing master
+    (if any) and carries forward Boot Time, Error, and
+    Application Team Validation Status for every server that already has
+    those values.  This ensures the Validation Agent's work is NEVER erased
+    by a subsequent Implementation Status mail arriving.
 
     Returns:
         The merged DataFrame, or None if no source files exist.
@@ -130,56 +186,143 @@ def build_master_excel(default_impl_status: str = "Pending") -> pd.DataFrame | N
 
     for folder_name, priority in _SUBFOLDER_PRIORITY.items():
         folder_path = os.path.join(EXCELS_FOLDER, folder_name)
-        latest_file = _get_latest_file(folder_path)
 
-        if not latest_file:
-            logger.debug("No file found in %s — skipping.", folder_path)
-            continue
+        if folder_name == "ImplementationStatus":
+            # ----------------------------------------------------------------
+            # Read ALL implementation status files so every mail's servers
+            # are included.  Sort oldest→newest so that when the same server
+            # appears in two mails the newer file's row wins after drop_duplicates.
+            # ----------------------------------------------------------------
+            files = _get_all_files(folder_path)
+            if not files:
+                logger.debug("No files found in %s — skipping.", folder_path)
+                continue
 
-        try:
-            df = _read_file(latest_file)
-            df.columns = df.columns.str.strip()
-            df["_source_folder"] = folder_name
-            df["_source_file"]   = latest_file.name
-            df["_priority"]      = priority
-            dfs.append(df)
-            logger.debug("Loaded %d rows from %s", len(df), latest_file)
-        except Exception as exc:
-            logger.error("Failed to read %s: %s", latest_file, exc)
+            for file_path in files:
+                try:
+                    df = _read_file(file_path)
+                    df.columns = df.columns.str.strip()
+                    df["_source_folder"] = folder_name
+                    df["_source_file"]   = file_path.name
+                    df["_priority"]      = priority
+                    dfs.append(df)
+                    logger.debug("Loaded %d rows from %s", len(df), file_path)
+                except Exception as exc:
+                    logger.error("Failed to read %s: %s", file_path, exc)
+
+        else:
+            # Maintenance / Rescheduled — latest file only
+            latest_file = _get_latest_file(folder_path)
+            if not latest_file:
+                logger.debug("No file found in %s — skipping.", folder_path)
+                continue
+            try:
+                df = _read_file(latest_file)
+                df.columns = df.columns.str.strip()
+                df["_source_folder"] = folder_name
+                df["_source_file"]   = latest_file.name
+                df["_priority"]      = priority
+                dfs.append(df)
+                logger.debug("Loaded %d rows from %s", len(df), latest_file)
+            except Exception as exc:
+                logger.error("Failed to read %s: %s", latest_file, exc)
 
     if not dfs:
         logger.warning("build_master_excel: no source files found — nothing to merge.")
         return None
 
-    master_df = pd.concat(dfs, ignore_index=True)
+    combined = pd.concat(dfs, ignore_index=True)
 
     # Ensure required columns exist
     for col in IMPORTANT_COLUMNS:
-        if col not in master_df.columns:
-            master_df[col] = None
+        if col not in combined.columns:
+            combined[col] = None
 
-    # Deduplicate: keep the row with the highest priority
-    master_df.sort_values("_priority", inplace=True)
-    master_df.drop_duplicates(subset=["Server Name"], keep="last", inplace=True)
-    master_df["Implementation Status"] = master_df["Implementation Status"].fillna(default_impl_status)
+    # Deduplicate: sort so highest-priority (and newest within same priority)
+    # row ends up last, then keep='last'
+    combined.sort_values(["_priority"], inplace=True)
+    combined.drop_duplicates(subset=["Server Name"], keep="last", inplace=True)
+
+    combined["Implementation Status"] = combined["Implementation Status"].fillna(default_impl_status)
 
     # Drop internal helper columns before saving
-    master_df.drop(columns=["_priority"], inplace=True)
+    combined.drop(columns=["_priority"], inplace=True)
 
-    # Atomic write: write to a temp file then rename
+    # ------------------------------------------------------------------
+    # Preserve Validation Agent data from the existing master
+    # ------------------------------------------------------------------
+    # Load the current master (if it exists) and carry forward any
+    # non-empty values in the validation columns.  This means that even
+    # when a brand-new Implementation Status mail triggers a rebuild,
+    # servers whose boot time / validation status was already recorded
+    # keep that data intact.
     master_path = os.path.join(EXCELS_FOLDER, "master_patch_data.xlsx")
-    # tmp_path    = master_path + ".tmp"
+
+    if os.path.exists(master_path):
+        try:
+            with _excel_lock:
+                existing = pd.read_excel(master_path)
+            existing.columns = existing.columns.str.strip()
+
+            # Build a lookup: server_name (lower) → {col: value}
+            val_cols_present = [c for c in _VALIDATION_COLUMNS if c in existing.columns]
+
+            if val_cols_present:
+                existing["_key"] = existing["Server Name"].astype(str).str.strip().str.lower()
+                val_lookup = (
+                    existing[["_key"] + val_cols_present]
+                    .drop_duplicates(subset=["_key"], keep="last")
+                    .set_index("_key")
+                )
+
+                combined["_key"] = combined["Server Name"].astype(str).str.strip().str.lower()
+
+                # Ensure validation columns exist in combined
+                for col in val_cols_present:
+                    if col not in combined.columns:
+                        combined[col] = None
+
+                # For each validation column, fill from existing master
+                # only where the new combined frame has an empty cell
+                for col in val_cols_present:
+                    def _carry_forward(row, col=col):
+                        current = row[col]
+                        # If already populated in combined, keep it
+                        if current is not None and not (
+                            isinstance(current, float) and pd.isna(current)
+                        ) and str(current).strip() != "":
+                            return current
+                        # Otherwise look up from existing master
+                        key = row["_key"]
+                        if key in val_lookup.index:
+                            existing_val = val_lookup.at[key, col]
+                            if existing_val is not None and not (
+                                isinstance(existing_val, float) and pd.isna(existing_val)
+                            ) and str(existing_val).strip() != "":
+                                return existing_val
+                        return current
+
+                    combined[col] = combined.apply(_carry_forward, axis=1)
+
+                combined.drop(columns=["_key"], inplace=True)
+                logger.info(
+                    "Carried forward validation data from existing master for columns: %s",
+                    val_cols_present,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not carry forward validation data from existing master: %s", exc
+            )
+
+    # Write master atomically
     with _excel_lock:
-        master_df.to_excel(master_path, index=False)
+        combined.to_excel(master_path, index=False)
+        logger.info(
+            "Master Excel rebuilt — %d unique servers → %s", len(combined), master_path
+        )
         print(f"Master Excel updated: {master_path}")
- 
 
-    # with _excel_lock:
-    #     master_df.to_excel(tmp_path, index=False)
-    #     os.replace(tmp_path, master_path)
-
-    logger.info("Master Excel rebuilt — %d unique servers → %s", len(master_df), master_path)
-    return master_df
+    return combined
 
 
 def load_excel() -> pd.DataFrame | None:
@@ -212,8 +355,8 @@ def delete_stale_files(days: int = 14) -> int:
     Returns:
         Number of files deleted.
     """
-    cutoff   = datetime.now() - timedelta(days=days)
-    deleted  = 0
+    cutoff  = datetime.now() - timedelta(days=days)
+    deleted = 0
 
     for file_path in Path(EXCELS_FOLDER).iterdir():
         if file_path.is_file():
@@ -226,198 +369,106 @@ def delete_stale_files(days: int = 14) -> int:
     return deleted
 
 
-
+# ---------------------------------------------------------------------------
+# Excel query tools
+# ---------------------------------------------------------------------------
 
 def filter_by_application_name(keyword: str) -> str:
-    """
-    Filter rows where 'Application Name' contains *keyword* (case-insensitive).
-
-    Args:
-        keyword: Partial or full application name to search for.
-
-    Returns:
-        JSON string with count and matching rows.
-    """
     df = load_excel()
     if df is None:
         return json.dumps({"error": "Master Excel could not be loaded."})
 
     mask     = df["Application Name"].str.contains(re.escape(keyword), case=False, na=False)
     filtered = df[mask][IMPORTANT_COLUMNS]
-
     return json.dumps({"count": len(filtered), "results": filtered.to_dict(orient="records")})
 
 
 def get_column_names() -> str:
-    """
-    Return all column names present in the master Excel.
-
-    Returns:
-        JSON string listing column names.
-    """
     df = load_excel()
     if df is None:
         return json.dumps({"error": "Master Excel could not be loaded."})
-
     return json.dumps({"columns": list(df.columns)})
 
 
 def get_summary_stats(column_name: str) -> str:
-    """
-    Return descriptive statistics for a numeric column.
-
-    Args:
-        column_name: Name of the column to describe.
-
-    Returns:
-        JSON string of pandas describe() output.
-    """
     df = load_excel()
     if df is None:
         return json.dumps({"error": "Master Excel could not be loaded."})
-
     if column_name not in df.columns:
         return json.dumps({"error": f"Column '{column_name}' not found."})
-
     return json.dumps(df[column_name].describe().to_dict())
 
 
 def get_unique_values(column_name: str) -> str:
-    """
-    Return all unique non-null values in a column.
-
-    Args:
-        column_name: Column to inspect.
-
-    Returns:
-        JSON string with column name and unique values.
-    """
     df = load_excel()
     if df is None:
         return json.dumps({"error": "Master Excel could not be loaded."})
-
     if column_name not in df.columns:
         return json.dumps({"error": f"Column '{column_name}' not found."})
-
-    unique_vals = df[column_name].dropna().unique().tolist()
-    return json.dumps({"column": column_name, "unique_values": unique_vals})
+    return json.dumps({"column": column_name, "unique_values": df[column_name].dropna().unique().tolist()})
 
 
 def get_row_count() -> str:
-    """
-    Return the total number of server rows in the master Excel.
-
-    Returns:
-        JSON string with the row count.
-    """
     df = load_excel()
     if df is None:
         return json.dumps({"error": "Master Excel could not be loaded."})
-
     return json.dumps({"total_rows": len(df)})
 
 
 def filter_by_column_value(column_name: str, value: str) -> str:
-    """
-    Filter rows where *column_name* contains *value* (case-insensitive).
-
-    Args:
-        column_name: Column to filter on.
-        value:       Value to search for.
-
-    Returns:
-        JSON string with count and matching rows (important columns only).
-    """
     df = load_excel()
     if df is None:
         return json.dumps({"error": "Master Excel could not be loaded."})
-
     if column_name not in df.columns:
         return json.dumps({"error": f"Column '{column_name}' not found."})
-
     mask     = df[column_name].astype(str).str.contains(re.escape(value), case=False, na=False)
     filtered = df[mask]
-
-    # Return only important columns that actually exist in the DataFrame
-    cols = [c for c in IMPORTANT_COLUMNS if c in filtered.columns]
+    cols     = [c for c in IMPORTANT_COLUMNS if c in filtered.columns]
     return json.dumps({"count": len(filtered), "results": filtered[cols].to_dict(orient="records")})
 
 
 def get_all_rows() -> str:
-    """
-    Return every row in the master Excel (important columns only, max 200 rows).
-
-    Returns:
-        JSON string with count and rows.
-    """
     df = load_excel()
     if df is None:
         return json.dumps({"error": "Master Excel could not be loaded."})
-
-    cols     = [c for c in IMPORTANT_COLUMNS if c in df.columns]
-    limited  = df[cols].head(200)
-
+    cols    = [c for c in IMPORTANT_COLUMNS if c in df.columns]
+    limited = df[cols].head(200)
     return json.dumps({"count": len(df), "results": limited.to_dict(orient="records")})
 
 
 def get_lyric_servers() -> str:
-    """
-    Return all servers whose Application Name contains 'lyric'.
-
-    Returns:
-        JSON string with count and server details (important columns).
-    """
     df = load_excel()
     if df is None:
         return json.dumps({"error": "Master Excel could not be loaded."})
-
     mask     = df["Application Name"].str.contains("lyric", case=False, na=False)
     filtered = df[mask][IMPORTANT_COLUMNS].head(50)
-
     return json.dumps({"count": len(filtered), "results": filtered.to_dict(orient="records")})
 
 
 def lyric_summary() -> str:
-    """
-    Aggregate summary for all lyric application servers.
-
-    Returns:
-        JSON with total count, reboot distribution, and unique patch windows.
-    """
     df = load_excel()
     if df is None:
         return json.dumps({"error": "Master Excel could not be loaded."})
-
-    lyric = df[df["Application Name"].str.contains("lyric", case=False, na=False)]
-
+    lyric   = df[df["Application Name"].str.contains("lyric", case=False, na=False)]
     summary = {
-        "total_servers":    len(lyric),
-        "reboot_required":  lyric["Reboot Required"].value_counts().to_dict(),
-        "patch_windows":    lyric["Patch Window"].dropna().unique().tolist(),
+        "total_servers":   len(lyric),
+        "reboot_required": lyric["Reboot Required"].value_counts().to_dict(),
+        "patch_windows":   lyric["Patch Window"].dropna().unique().tolist(),
     }
-
     return json.dumps(summary)
 
 
+# ---------------------------------------------------------------------------
+# Mail helpers
+# ---------------------------------------------------------------------------
 
 def _resolve_folder_id(folder_name: str) -> str | None:
-    """
-    Resolve an Outlook subfolder name under Inbox to its Graph API folder ID.
-
-    Args:
-        folder_name: Display name of the subfolder (e.g. 'Enterprise Patching').
-
-    Returns:
-        The folder ID string, or None if not found.
-    """
     url      = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/childFolders"
     response = requests.get(url, headers=get_headers(), timeout=15)
     response.raise_for_status()
-
     for folder in response.json().get("value", []):
         if folder["displayName"] == folder_name:
             return folder["id"]
-
     return None
 
 
@@ -425,18 +476,16 @@ def _save_attachment(att: dict, subject: str) -> str | None:
     """
     Decode and save an email attachment to the correct sub-folder.
 
-    The destination sub-folder is determined by keywords in the email subject:
-        'Maintenance Notification' → Maintenance/
-        'Reschedule Maintenance'   → Rescheduled/
-        'Implementation Status'    → ImplementationStatus/
-
-    Args:
-        att:     Attachment dict from the Graph API (must contain 'name' and 'contentBytes').
-        subject: Email subject string used to route the file.
-
-    Returns:
-        The saved file path as a string, or None if the subject did not match
-        any known category or the file extension was not an Excel type.
+    Routing rules
+    -------------
+    'Maintenance Notification'  → Maintenance/maintenance_latest.xlsx
+        (single file, overwritten each time — newest mail wins)
+    'Reschedule Maintenance'    → Rescheduled/rescheduled_latest.xlsx
+        (single file, overwritten each time — newest mail wins)
+    'Implementation Status'     → ImplementationStatus/implementation_<timestamp>.xlsx
+        (NEW timestamped file per mail — ALL files are kept so that servers
+        from different mails accumulate in the master Excel instead of
+        overwriting each other)
     """
     file_name = att.get("name", "")
     ext       = Path(file_name).suffix.lower()
@@ -445,16 +494,20 @@ def _save_attachment(att: dict, subject: str) -> str | None:
         logger.debug("Skipping non-Excel attachment: %s", file_name)
         return None
 
-    # Route by subject keyword
     if "Maintenance Notification" in subject:
         sub_folder = "Maintenance"
         save_name  = "maintenance_latest.xlsx"
+
     elif "Reschedule Maintenance" in subject:
         sub_folder = "Rescheduled"
         save_name  = "rescheduled_latest.xlsx"
+
     elif "Implementation Status" in subject:
         sub_folder = "ImplementationStatus"
-        save_name  = "implementation_latest.xlsx"
+        # Unique filename per mail — preserves ALL implementation status files
+        timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_name  = f"implementation_{timestamp}.xlsx"
+
     else:
         logger.debug("Subject '%s' did not match any routing rule — skipping.", subject)
         return None
@@ -465,7 +518,6 @@ def _save_attachment(att: dict, subject: str) -> str | None:
 
     try:
         file_data = base64.b64decode(att["contentBytes"])
-        # Atomic write
         tmp_path  = save_path + ".tmp"
         with open(tmp_path, "wb") as fh:
             fh.write(file_data)
@@ -476,17 +528,17 @@ def _save_attachment(att: dict, subject: str) -> str | None:
         logger.error("Failed to save attachment '%s': %s", file_name, exc)
         return None
 
-# def _run_validation_safe(query: str):
-#     try:
-#         run_validation_agent(query)
-#     except Exception as exc:
-#         logger.error("[Validation Thread] Agent failed: %s", exc, exc_info=True)
 
-_validation_lock: threading.Lock = threading.Lock()
+# ---------------------------------------------------------------------------
+# Validation agent runner
+# ---------------------------------------------------------------------------
+
+_validation_lock:   threading.Lock  = threading.Lock()
 _validation_pending: threading.Event = threading.Event()
 
+
 def _run_validation_safe(query: str) -> None:
-    _validation_pending.set()   # signal that a run is wanted
+    _validation_pending.set()
 
     acquired = _validation_lock.acquire(blocking=False)
     if not acquired:
@@ -495,17 +547,20 @@ def _run_validation_safe(query: str) -> None:
 
     try:
         while _validation_pending.is_set():
-            _validation_pending.clear()   # consume the pending signal
+            _validation_pending.clear()
             logger.info("[Validation Thread] Starting validation agent...")
             try:
                 run_validation_agent(query)
             except Exception as exc:
                 logger.error("[Validation Thread] Agent failed: %s", exc, exc_info=True)
-            # if another mail arrived during the run, _validation_pending will be set again
-            # and the while loop runs once more before releasing the lock
     finally:
         _validation_lock.release()
         logger.info("[Validation Thread] Validation agent finished.")
+
+
+# ---------------------------------------------------------------------------
+# Mail tools
+# ---------------------------------------------------------------------------
 
 def get_latest_mail(folder_name: str = "") -> str:
     """
@@ -514,12 +569,6 @@ def get_latest_mail(folder_name: str = "") -> str:
     If the email subject matches a known patching category and contains
     Excel attachments, those attachments are automatically saved and the
     master Excel is rebuilt.
-
-    Args:
-        folder_name: Override the default FOLDER_NAME from .env (optional).
-
-    Returns:
-        JSON string with message metadata and a list of saved attachment paths.
     """
     target = folder_name or FOLDER_NAME
 
@@ -546,16 +595,14 @@ def get_latest_mail(folder_name: str = "") -> str:
         body       = mail.get("bodyPreview", "")
         received   = mail.get("receivedDateTime", "")
 
+        # Content-based dedup
         mail_hash = _make_mail_hash(subject, received, sender)
         with _mail_hash_lock:
             if mail_hash in _processed_mail_hashes:
                 logger.info(
-                    "Duplicate mail content detected (subject='%s', received='%s') "
-                    "— skipping processing.",
+                    "Duplicate mail content detected (subject='%s', received='%s') — skipping.",
                     subject, received,
                 )
-                # Return a consistent shape so the agent doesn't get confused
-                # by a missing 'attachments_saved' key
                 return json.dumps({
                     "message_id":        message_id,
                     "subject":           subject,
@@ -570,7 +617,6 @@ def get_latest_mail(folder_name: str = "") -> str:
 
         attachments_saved: list[str] = []
 
-        # Download attachments only when subject matches a known category
         patching_keywords = [
             "Maintenance Notification",
             "Reschedule Maintenance",
@@ -588,24 +634,26 @@ def get_latest_mail(folder_name: str = "") -> str:
                 if saved_path:
                     attachments_saved.append(saved_path)
 
-        # Rebuild master only if we actually saved something
         if attachments_saved:
+            # Rebuild master — carries forward all previously written
+            # boot times and validation statuses automatically
             build_master_excel()
-            if "Implementation Status" in subject:
-                logger.info("[Mail Tool] Implementation Status mail arrived-starting Validation Agent...")
-                threading.Thread(
-                target=_run_validation_safe,
-                args=(
-                    "Get all lyric servers where Implementation Status is Completed, "
-                    "connect to each via WinRM to fetch the boot time/errors, save it to Excel, "
-                    "then validate if the boot time(if there) is within the patch window and update the "
-                    "Application Team Validation Status for every server.",
-                ),
-                daemon=True,
-            ).start()
 
-                # Return early — tell the email agent its job is done for this mail type.
-                # No summary, no further tool calls needed — validation agent owns this.
+            if "Implementation Status" in subject:
+                logger.info(
+                    "[Mail Tool] Implementation Status mail arrived — starting Validation Agent..."
+                )
+                threading.Thread(
+                    target=_run_validation_safe,
+                    args=(
+                        "Get all lyric servers where Implementation Status is Completed, "
+                        "connect to each via WinRM to fetch the boot time/errors, save it to Excel, "
+                        "then validate if the boot time (if present) is within the patch window and "
+                        "update the Application Team Validation Status for every server.",
+                    ),
+                    daemon=True,
+                ).start()
+
                 return json.dumps({
                     "message_id":        message_id,
                     "subject":           subject,
@@ -615,14 +663,16 @@ def get_latest_mail(folder_name: str = "") -> str:
                     "attachments_saved": attachments_saved,
                     "delegated":         True,
                     "message":           (
-                        "Implementation Status mail received. Excel attachment saved and master "
-                        "rebuilt. Validation Agent has been triggered to fetch boot times and "
-                        "validate all completed Lyric servers. No further action required from "
-                        "the email agent."
+                        "Implementation Status mail received. Excel attachment saved with a unique "
+                        "timestamped filename so previous servers are preserved. Master Excel rebuilt "
+                        "(existing Boot Time / Validation Status data carried forward). "
+                        "Validation Agent triggered for all completed Lyric servers. "
+                        "No further action required from the email agent."
                     ),
                 })
             else:
-                logger.info(f"[Mail Tool] '{subject}' mail processed — validation agent not triggered.")
+                logger.info("[Mail Tool] '%s' mail processed — validation agent not triggered.", subject)
+
         return json.dumps({
             "message_id":        message_id,
             "subject":           subject,
@@ -638,15 +688,7 @@ def get_latest_mail(folder_name: str = "") -> str:
 
 
 def search_mails_by_subject(keyword: str) -> str:
-    """
-    Search emails in the monitored folder whose subject contains *keyword*.
-
-    Args:
-        keyword: Case-insensitive substring to match against email subjects.
-
-    Returns:
-        JSON string with matching email summaries (up to 10).
-    """
+    """Search emails in the monitored folder by a subject keyword (up to 10 results)."""
     try:
         folder_id = _resolve_folder_id(FOLDER_NAME)
         if not folder_id:
@@ -678,13 +720,13 @@ def search_mails_by_subject(keyword: str) -> str:
         return json.dumps({"error": str(exc)})
 
 
-
+# ---------------------------------------------------------------------------
+# TOOL_REGISTRY
+# ---------------------------------------------------------------------------
 
 TOOL_REGISTRY: dict[str, callable] = {
-    # Mail
-    "get_latest_mail":         get_latest_mail,
-    "search_mails_by_subject": search_mails_by_subject,
-    # Excel — query
+    "get_latest_mail":            get_latest_mail,
+    "search_mails_by_subject":    search_mails_by_subject,
     "filter_by_application_name": filter_by_application_name,
     "get_column_names":           get_column_names,
     "get_summary_stats":          get_summary_stats,
@@ -697,10 +739,11 @@ TOOL_REGISTRY: dict[str, callable] = {
 }
 
 
-
+# ---------------------------------------------------------------------------
+# TOOL_SCHEMAS
+# ---------------------------------------------------------------------------
 
 TOOL_SCHEMAS: list[dict] = [
-    # ---- Mail tools --------------------------------------------------------
     {
         "type": "function",
         "function": {
@@ -727,7 +770,7 @@ TOOL_SCHEMAS: list[dict] = [
             "name":        "search_mails_by_subject",
             "description": "Search emails in the monitored folder by a subject keyword (up to 10 results).",
             "parameters": {
-                "type":     "object",
+                "type":       "object",
                 "properties": {
                     "keyword": {
                         "type":        "string",
@@ -738,7 +781,6 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
-    # ---- Excel query tools -------------------------------------------------
     {
         "type": "function",
         "function": {
@@ -761,7 +803,7 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name":        "get_column_names",
             "description": "Return all column names in the master patch Excel file.",
-            "parameters": {"type": "object", "properties": {}},
+            "parameters":  {"type": "object", "properties": {}},
         },
     },
     {
@@ -803,7 +845,7 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name":        "get_row_count",
             "description": "Return the total number of server entries in the master Excel.",
-            "parameters": {"type": "object", "properties": {}},
+            "parameters":  {"type": "object", "properties": {}},
         },
     },
     {
@@ -843,7 +885,7 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name":        "get_lyric_servers",
             "description": "Return all servers belonging to the Lyric application (up to 50 rows).",
-            "parameters": {"type": "object", "properties": {}},
+            "parameters":  {"type": "object", "properties": {}},
         },
     },
     {

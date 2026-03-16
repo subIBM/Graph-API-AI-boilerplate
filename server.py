@@ -32,6 +32,7 @@ from flask import Flask, jsonify, request
 
 from auth import get_headers
 from email_agent import run_agent
+from alert_agent import start_alert_scheduler
 
 
 load_dotenv()
@@ -341,6 +342,7 @@ if __name__ == "__main__":
     # Schedule periodic subscription renewal every 12 hours
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(renew_subscription, "interval", hours=12, id="renew_sub")
+    start_alert_scheduler(scheduler=scheduler)
     scheduler.start()
     logger.info("Subscription renewal scheduler started (every 12 hours).")
 

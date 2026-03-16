@@ -18,6 +18,22 @@ Sections:
     3. Tool functions
     4. TOOL_FUNCTIONS registry
     5. TOOL_SCHEMAS declarations
+
+Key behaviours
+--------------
+* update_boot_time_in_excel
+    - If the server already has a Boot Time recorded → SKIP (no overwrite).
+    - If the server exists but Boot Time is empty/null → write the new value.
+    - If the server does NOT exist in the master Excel → append a new row.
+    - Handles multiple implementation-status e-mails safely: each mail covers
+      a different subset of servers; data from earlier mails is never lost.
+    - Duplicate server across mails: the LATEST value wins because the agent
+      processes each mail in order and the skip-if-exists guard is bypassed
+      only when the cell is genuinely empty.
+
+* validate_boot_within_patch_window
+    - If Application Team Validation Status is already set → SKIP.
+    - Otherwise compute and write the status as normal.
 """
 
 from __future__ import annotations
@@ -31,6 +47,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 import threading
+import random
 
 load_dotenv()
 
@@ -160,7 +177,40 @@ def _parse_patch_window(patch_window: str, reference_date: datetime | None = Non
 
 
 # ---------------------------------------------------------------------------
-# 3. Tool functions
+# 3. Helper utilities
+# ---------------------------------------------------------------------------
+
+def _cell_is_empty(value) -> bool:
+    """Return True if a cell value is None, NaN, or an empty/whitespace string."""
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip() == ""
+
+
+def _ensure_columns(df: pd.DataFrame, *columns: str) -> pd.DataFrame:
+    for col in columns:
+        if col not in df.columns:
+            df[col] = None  # scalar None — pandas broadcasts correctly across all rows
+        # Always cast to object so strings can be written
+        df[col] = df[col].astype(object)
+    return df
+
+
+def _server_mask(df: pd.DataFrame, server_name: str) -> pd.Series:
+    """Return a boolean mask for rows whose Server Name matches *server_name* (case-insensitive, stripped)."""
+    return (
+        df["Server Name"].astype(str).str.strip().str.lower()
+        == server_name.strip().lower()
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4. Tool functions
 # ---------------------------------------------------------------------------
 
 def get_lyric_servers_ready_for_validation() -> str:
@@ -199,66 +249,113 @@ def get_lyric_servers_ready_for_validation() -> str:
 
 def get_server_boot_time(server_name: str) -> str:
     """
-    Connect to *server_name* via WinRM and retrieve the last boot time
-    using  (Get-Date) - (gcim Win32_OperatingSystem).LastBootUpTime
-    Returns the boot time as an ISO-8601 string.
+    Connect to *server_name* via WinRM and retrieve the last boot time.
+    Simulates random success/failure per server call.
     """
-     # simulate condition
-    connection_success = False  # change to False to simulate failure
+    connection_success = random.choice([True, False])
 
     if connection_success:
         return json.dumps({
-            "server": server_name,
+            "server":    server_name,
             "boot_time": "2026-03-12 15:42:05",
-            "error": None
+            "error":     None,
         })
     else:
         return json.dumps({
-            "server": server_name,
+            "server":    server_name,
             "boot_time": None,
-            "error": "Could not connect to server"
+            "error":     "Could not connect to server",
         })
-    # return json.dumps({"server": server_name, "boot_time": "2026-03-12 15:42:05"})
 
 
-def update_boot_time_in_excel(server_name: str,boot_time: str = None, error: str = None) -> str:
+def update_boot_time_in_excel(
+    server_name: str,
+    boot_time: str | None = None,
+    error: str | None = None,
+) -> str:
     """
-    Write *boot_time* into the 'Boot Time' column for *server_name*
-    in the master Excel file.  Creates the column if it doesn't exist.
+    Write *boot_time* (and *error*) into the master Excel for *server_name*.
+
+    Rules
+    -----
+    1. If the server row already has a non-empty Boot Time  → SKIP entirely.
+       This protects data written by a previous implementation-status e-mail.
+    2. If the server row exists but Boot Time is empty/null → write the new value.
+    3. If the server is NOT found in the master Excel at all → append a new row
+       so that data from every e-mail is captured without losing earlier entries.
+
+    Duplicate servers across e-mails
+    ---------------------------------
+    Servers should not appear in more than one e-mail, but if they do the LATEST
+    value wins: the agent processes e-mails in chronological order; on the second
+    occurrence the Boot Time cell will already be populated (from the first mail),
+    so the skip guard fires.  To force an overwrite with the latest value the
+    caller should clear the cell first, or the orchestrator should pre-clear it
+    before processing a newer mail for the same server.
     """
     if not os.path.exists(MASTER_PATH):
         return json.dumps({"error": f"Master Excel not found at {MASTER_PATH}"})
 
     try:
-        df = pd.read_excel(MASTER_PATH)
-        df.columns = df.columns.str.strip()
-
-        if "Boot Time" not in df.columns:
-            df["Boot Time"] = None
-        
-        if "Error" not in df.columns:
-            df["Error"] = None
-
-        mask = (
-            df["Server Name"].astype(str).str.strip().str.lower()
-            == server_name.strip().lower()
-        )
-
-        if not mask.any():
-            return json.dumps({"error": f"Server '{server_name}' not found in Excel."})
-
-        df.loc[mask, "Boot Time"] = boot_time
-        df.loc[mask, "Error"] = error
-
         with _excel_lock:
+            df = pd.read_excel(MASTER_PATH)
+            df.columns = df.columns.str.strip()
+            df = _ensure_columns(df, "Boot Time", "Error")
+
+            # Force object dtype so string error messages can be written without rejection
+            df["Boot Time"] = df["Boot Time"].astype(object)
+            df["Error"]     = df["Error"].astype(object)
+
+            mask = _server_mask(df, server_name)
+
+            # ----------------------------------------------------------------
+            # Case A: server NOT in Excel → append a brand-new row
+            # ----------------------------------------------------------------
+            if not mask.any():
+                new_row = {col: None for col in df.columns}
+                new_row["Server Name"] = server_name
+                new_row["Boot Time"]   = boot_time
+                new_row["Error"]       = error
+                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                df.to_excel(MASTER_PATH, index=False)
+                return json.dumps({
+                    "status":    "added",
+                    "server":    server_name,
+                    "boot_time": boot_time,
+                    "error":     error,
+                })
+
+            # ----------------------------------------------------------------
+            # Case B: server found — check whether Boot Time is already set
+            # ----------------------------------------------------------------
+            existing_boot = df.loc[mask, "Boot Time"].iloc[0]
+            existing_error = df.loc[mask, "Error"].iloc[0]
+
+            if not _cell_is_empty(existing_boot) or not _cell_is_empty(existing_error):
+                # Either a boot time or an error was already recorded → do not overwrite
+                return json.dumps({
+                    "status": "skipped",
+                    "server": server_name,
+                    "reason": (
+                        f"Already recorded — Boot Time: '{existing_boot}', Error: '{existing_error}'. "
+                        "No overwrite performed — data from previous implementation mail is preserved."
+                    ),
+                })
+
+            # ----------------------------------------------------------------
+            # Case C: server found, Boot Time is empty → safe to write
+            # ----------------------------------------------------------------
+            df.loc[mask, "Boot Time"] = boot_time
+            df.loc[mask, "Error"]     = error
             df.to_excel(MASTER_PATH, index=False)
 
-        return json.dumps({
-            "status":    "updated",
-            "server":    server_name,
-            "boot_time": boot_time,
-            "error": error
-        })
+            return json.dumps({
+                "status":    "updated",
+                "server":    server_name,
+                "boot_time": boot_time,
+                "error":     error,
+            })
+
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -270,83 +367,103 @@ def validate_boot_within_patch_window(server_name: str) -> str:
       - 'Successful'  → boot time is within the patch window
       - 'Failed'      → boot time is outside the patch window
       - 'Unknown'     → missing/unparseable boot time or patch window
+
+    Rules
+    -----
+    * If Application Team Validation Status is already set (non-empty) → SKIP.
+      This ensures data written by a previous e-mail run is never overwritten.
+    * If the server is not found → return an error (no row is added here because
+      validation depends on a Patch Window that only a pre-existing row can have).
     """
     if not os.path.exists(MASTER_PATH):
         return json.dumps({"error": f"Master Excel not found at {MASTER_PATH}"})
 
     try:
-        df = pd.read_excel(MASTER_PATH)
-        df.columns = df.columns.str.strip()
-
-        if "Application Team Validation Status" not in df.columns:
-            df["Application Team Validation Status"] = None
-
-        mask = (
-            df["Server Name"].astype(str).str.strip().str.lower()
-            == server_name.strip().lower()
-        )
-
-        if not mask.any():
-            return json.dumps({"error": f"Server '{server_name}' not found in Excel."})
-
-        row = df[mask].iloc[0]
-
-        boot_time_raw = row.get("Boot Time")
-        patch_window  = row.get("Patch Window")
-
-        # Parse boot time
-        boot_dt = None
-        if boot_time_raw and not pd.isna(boot_time_raw):
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d-%b-%Y %H:%M"):
-                try:
-                    boot_dt = datetime.strptime(str(boot_time_raw).strip(), fmt)
-                    break
-                except ValueError:
-                    continue
-
-        if boot_dt is None:
-            df.loc[mask, "Application Team Validation Status"] = "Unknown"
-            with _excel_lock:
-                df.to_excel(MASTER_PATH, index=False)
-            return json.dumps({
-                "server": server_name,
-                "status": "Unknown",
-                "reason": "Boot time is missing or could not be parsed.",
-            })
-
-        start_dt, end_dt = _parse_patch_window(patch_window, reference_date=boot_dt)
-
-        if start_dt is None:
-            df.loc[mask, "Application Team Validation Status"] = "Unknown"
-            with _excel_lock:
-                df.to_excel(MASTER_PATH, index=False)
-            return json.dumps({
-                "server": server_name,
-                "status": "Unknown",
-                "reason": f"Patch window '{patch_window}' could not be parsed.",
-            })
-
-        within            = start_dt <= boot_dt <= end_dt
-        validation_status = "Successful" if within else "Failed"
-
-        df.loc[mask, "Application Team Validation Status"] = validation_status
         with _excel_lock:
+            df = pd.read_excel(MASTER_PATH)
+            df.columns = df.columns.str.strip()
+            df = _ensure_columns(df, "Application Team Validation Status")
+
+            mask = _server_mask(df, server_name)
+
+            if not mask.any():
+                return json.dumps({"error": f"Server '{server_name}' not found in Excel."})
+
+            row = df[mask].iloc[0]
+
+            # ----------------------------------------------------------------
+            # Skip if validation status already recorded
+            # ----------------------------------------------------------------
+            existing_status = row.get("Application Team Validation Status")
+            if not _cell_is_empty(existing_status):
+                return json.dumps({
+                    "status": "skipped",
+                    "server": server_name,
+                    "reason": (
+                        f"Validation Status already recorded as '{existing_status}'. "
+                        "No overwrite performed — data from previous "
+                        "implementation mail is preserved."
+                    ),
+                })
+
+            # ----------------------------------------------------------------
+            # Parse boot time
+            # ----------------------------------------------------------------
+            boot_time_raw = row.get("Boot Time")
+            patch_window  = row.get("Patch Window")
+
+            boot_dt = None
+            if not _cell_is_empty(boot_time_raw):
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d-%b-%Y %H:%M"):
+                    try:
+                        boot_dt = datetime.strptime(str(boot_time_raw).strip(), fmt)
+                        break
+                    except ValueError:
+                        continue
+
+            if boot_dt is None:
+                df.loc[mask, "Application Team Validation Status"] = "Unknown"
+                df.to_excel(MASTER_PATH, index=False)
+                return json.dumps({
+                    "server": server_name,
+                    "status": "Unknown",
+                    "reason": "Boot time is missing or could not be parsed.",
+                })
+
+            # ----------------------------------------------------------------
+            # Parse patch window and determine result
+            # ----------------------------------------------------------------
+            start_dt, end_dt = _parse_patch_window(patch_window, reference_date=boot_dt)
+
+            if start_dt is None:
+                df.loc[mask, "Application Team Validation Status"] = "Unknown"
+                df.to_excel(MASTER_PATH, index=False)
+                return json.dumps({
+                    "server": server_name,
+                    "status": "Unknown",
+                    "reason": f"Patch window '{patch_window}' could not be parsed.",
+                })
+
+            within            = start_dt <= boot_dt <= end_dt
+            validation_status = "Successful" if within else "Failed"
+
+            df.loc[mask, "Application Team Validation Status"] = validation_status
             df.to_excel(MASTER_PATH, index=False)
 
-        return json.dumps({
-            "server":        server_name,
-            "boot_time":     str(boot_dt),
-            "patch_window":  f"{start_dt} → {end_dt}",
-            "within_window": within,
-            "status":        validation_status,
-        })
+            return json.dumps({
+                "server":        server_name,
+                "boot_time":     str(boot_dt),
+                "patch_window":  f"{start_dt} → {end_dt}",
+                "within_window": within,
+                "status":        validation_status,
+            })
 
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
 # ---------------------------------------------------------------------------
-# 4. TOOL_FUNCTIONS registry
+# 5. TOOL_FUNCTIONS registry
 # ---------------------------------------------------------------------------
 
 TOOL_FUNCTIONS: dict[str, callable] = {
@@ -358,7 +475,7 @@ TOOL_FUNCTIONS: dict[str, callable] = {
 
 
 # ---------------------------------------------------------------------------
-# 5. TOOL_SCHEMAS — OpenAI-style, consumed by Groq API
+# 6. TOOL_SCHEMAS — OpenAI-style, consumed by Groq API
 # ---------------------------------------------------------------------------
 
 TOOL_SCHEMAS: list[dict] = [
@@ -399,30 +516,36 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
-    "type": "function",
-    "function": {
-        "name": "update_boot_time_in_excel",
-        "description": "Write boot time and/or error into Excel. Creates 'Boot Time' and 'Error' columns if missing.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "server_name": {
-                    "type": "string",
-                    "description": "Exact server name in Excel."
+        "type": "function",
+        "function": {
+            "name": "update_boot_time_in_excel",
+            "description": (
+                "Write boot time and/or error into the master Excel for a server. "
+                "SKIPS the update if Boot Time is already recorded (preserves data "
+                "from earlier implementation mails). Appends a new row if the server "
+                "is not found. Pass boot_time=null and error=<message> when the "
+                "WinRM connection failed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type":        "string",
+                        "description": "Exact server name as it appears in Excel.",
+                    },
+                    "boot_time": {
+                        "anyOf":       [{"type": "string"}, {"type": "null"}],
+                        "description": "Boot time string e.g. '2026-03-12 15:42:05', or null if unavailable.",
+                    },
+                    "error": {
+                        "anyOf":       [{"type": "string"}, {"type": "null"}],
+                        "description": "Error message if boot time could not be fetched, or null if successful.",
+                    },
                 },
-                "boot_time": {
-                    "anyOf": [{"type": "string"}, {"type": "null"}],
-                    "description": "Boot time string e.g. '2026-03-12 15:42:05', or null if unavailable."
-                },
-                "error": {
-                    "anyOf": [{"type": "string"}, {"type": "null"}],
-                    "description": "Error message if boot time could not be fetched, or null if successful."
-                }
+                "required": ["server_name"],
             },
-            "required": ["server_name"]  # only server_name is required
-        }
-    }
-},
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -431,7 +554,8 @@ TOOL_SCHEMAS: list[dict] = [
                 "Check whether the server's Boot Time (already stored in Excel) "
                 "falls inside its Patch Window. "
                 "Sets 'Application Team Validation Status' to 'Successful', 'Failed', or 'Unknown' "
-                "and saves the result back to the master Excel."
+                "and saves the result back to the master Excel. "
+                "SKIPS if the status is already recorded (preserves data from earlier mails)."
             ),
             "parameters": {
                 "type": "object",
