@@ -219,6 +219,48 @@ def _is_empty(value) -> bool:
 # Tool functions
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# New tool: get_lyric_change_ticket
+# ---------------------------------------------------------------------------
+
+def get_lyric_change_ticket() -> str:
+    """
+    Read the master Excel and return the Change Ticket for Lyric servers.
+    All Lyric servers should share the same ticket; returns the first
+    non-empty value found.
+    """
+    if not os.path.exists(MASTER_PATH):
+        return json.dumps({"error": f"Master Excel not found at {MASTER_PATH}"})
+
+    try:
+        df = pd.read_excel(MASTER_PATH)
+        df.columns = df.columns.str.strip()
+
+        lyric_df = df[df["Application Name"].str.contains("lyric", case=False, na=False)]
+
+        if "Change Ticket" not in lyric_df.columns:
+            return json.dumps({"change_ticket": None, "note": "Change Ticket column not present."})
+
+        tickets = (
+            lyric_df["Change Ticket"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .replace("", pd.NA)
+            .dropna()
+            .unique()
+            .tolist()
+        )
+
+        if not tickets:
+            return json.dumps({"change_ticket": None, "note": "No Change Ticket found for Lyric servers."})
+
+        return json.dumps({"change_ticket": tickets[0], "all_tickets": tickets})
+
+    except Exception as exc:
+        logger.error("get_lyric_change_ticket failed: %s", exc)
+        return json.dumps({"error": str(exc)})
+    
 def get_lyric_alert_summary() -> str:
     """
     Read master Excel and return three categorised lists for Lyric servers:
@@ -358,6 +400,7 @@ def send_alert_email(subject: str, html_body: str) -> str:
 TOOL_FUNCTIONS = {
     "get_lyric_alert_summary": get_lyric_alert_summary,
     "send_alert_email":        send_alert_email,
+    "get_lyric_change_ticket":    get_lyric_change_ticket,
 }
 
 TOOL_SCHEMAS = [
@@ -388,6 +431,18 @@ TOOL_SCHEMAS = [
                 },
                 "required": ["subject", "html_body"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_lyric_change_ticket",
+            "description": (
+                "Read the master Excel and return the Change Ticket number (e.g. CHG083232) "
+                "for Lyric servers. All Lyric servers share the same ticket. "
+                "Use this to build the alert email subject line."
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
     },
 ]
