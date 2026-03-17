@@ -1,0 +1,10 @@
+python-dotenv
+msal
+requests
+pandas
+openpyxl
+groq
+flask
+apscheduler
+pytz
+tzlocal
