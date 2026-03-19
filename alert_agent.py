@@ -119,19 +119,19 @@ HTML body structure (use inline styles, no external CSS):
   - Horizontal rule
 
   SECTION 1 — only include if 'unreachable' list is non-empty:
-    Heading: "⚠ Servers Unreachable"
+    Heading: "Servers Unreachable"
     One-line message: "We were unable to connect to the following servers. Please look into this."
     Table columns: Server Name | Patch Window | Reboot Required
     One row per server from the 'unreachable' list.
 
   SECTION 2 — only include if 'failed' list is non-empty:
-    Heading: "✗ Reboot Not Confirmed Within Patch Window"
+    Heading: "Reboot Not Confirmed Within Patch Window"
     One-line message: "Could you please check if these servers were rebooted during the patch window?"
     Table columns: Server Name | Patch Window | Boot Time | Reboot Required
     One row per server from the 'failed' list.
 
   SECTION 3 — only include if 'pending' list is non-empty:
-    Heading: "? Validation Pending"
+    Heading: "Validation Pending"
     One-line message: "Could you please provide an update on the patching status for the following servers?"
     Table columns: Server Name | Patch Window | Reboot Required
     One row per server from the 'pending' list.
@@ -142,9 +142,9 @@ HTML body structure (use inline styles, no external CSS):
 ## Styling rules
   - Font: Arial, 14px, color #1a1a1a
   - Section headings: bold, 16px, margin-top 24px
-    - "⚠ Servers Unreachable" heading color: #b45309 (amber)
-    - "✗ Reboot Not Confirmed" heading color: #b91c1c (red)
-    - "? Validation Pending" heading color: #1d4ed8 (blue)
+    - "Servers Unreachable" heading color: #b45309 (amber)
+    - "Reboot Not Confirmed" heading color: #b91c1c (red)
+    - "Validation Pending" heading color: #1d4ed8 (blue)
   - Tables: border-collapse collapse, width 100%, font-size 13px, margin-top 8px
   - Table header row: background #f3f4f6, bold, border 1px solid #d1d5db, padding 8px 12px
   - Table data cells: border 1px solid #d1d5db, padding 8px 12px
@@ -352,7 +352,7 @@ def schedule_alert_for_window(window_end: datetime | None = None) -> None:
                 logger.debug("[Alert Scheduler] No previous alert job to remove")
         return
     
-    logger.info("[Alert Scheduler] ✓ Latest patch window end: %s", 
+    logger.info("[Alert Scheduler] Latest patch window end: %s", 
                window_end.strftime("%Y-%m-%d %H:%M:%S"))
     
     # Calculate when to trigger the alert
@@ -392,7 +392,7 @@ def schedule_alert_for_window(window_end: datetime | None = None) -> None:
             logger.debug("[Alert Scheduler] No previous alert job to remove")
         
         # Schedule new alert for exact trigger time
-        logger.info("[Alert Scheduler] 📌 Scheduling new alert for %s...",
+        logger.info("[Alert Scheduler]  Scheduling new alert for %s...",
                    trigger_time.strftime("%Y-%m-%d %H:%M:%S"))
         
         _scheduler.add_job(
@@ -423,7 +423,7 @@ def _trigger_alert_agent(query: str, window_end: datetime) -> None:
         window_end: The patch window end time (for logging)
     """
     logger.info(
-        "[Alert Scheduler] 🔔 ALERT TRIGGERED! Window ends at %s",
+        "[Alert Scheduler] ALERT TRIGGERED! Window ends at %s",
         window_end.strftime("%Y-%m-%d %H:%M")
     )
     
@@ -523,7 +523,7 @@ def notify_implementation_status_updated() -> None:
     This is much more efficient than polling every 60 seconds!
     """
     logger.info("="*70)
-    logger.info("[Alert Agent] 📧 IMPLEMENTATION STATUS EMAIL PROCESSED")
+    logger.info("[Alert Agent]  IMPLEMENTATION STATUS EMAIL PROCESSED")
     logger.info("="*70)
     
     try:
@@ -531,24 +531,24 @@ def notify_implementation_status_updated() -> None:
         latest_window_end = _get_latest_lyric_window_end()
         
         if latest_window_end is None:
-            logger.warning("[Alert Agent] ⚠️  No patch windows found in updated Excel")
+            logger.warning("[Alert Agent]   No patch windows found in updated Excel")
             logger.warning("[Alert Agent] Alert scheduling cancelled")
             logger.info("="*70)
             return
         
-        logger.info("[Alert Agent] ✓ Found patch window end time: %s", 
+        logger.info("[Alert Agent]  Found patch window end time: %s", 
                    latest_window_end.strftime("%Y-%m-%d %H:%M"))
         
         # Reschedule the alert
-        logger.info("[Alert Agent] 🔄 Rescheduling alert based on new data...")
+        logger.info("[Alert Agent]  Rescheduling alert based on new data...")
         schedule_alert_for_window(latest_window_end)
         
         logger.info("="*70)
-        logger.info("[Alert Agent] ✅ ALERT RESCHEDULED SUCCESSFULLY!")
+        logger.info("[Alert Agent]  ALERT RESCHEDULED SUCCESSFULLY!")
         logger.info("="*70)
         
     except Exception as exc:
-        logger.error("[Alert Agent] ❌ FAILED to reschedule alert: %s", exc)
+        logger.error("[Alert Agent]  FAILED to reschedule alert: %s", exc)
         logger.error("[Alert Agent] Stack trace:", exc_info=True)
         logger.info("="*70)
 
