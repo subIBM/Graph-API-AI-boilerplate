@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 GROQ_API_KEY : str = os.environ["GROQ_API_KEY"]
 GPT_MODEL    : str = os.environ.get("GPT_MODEL", "openai/gpt-oss-120b")
 
-PROMPTS_DIR  : Path = Path(__file__).parent / "prompts"
+PROMPTS_DIR  : Path = Path(__file__).parent / "prompts" /"Email Prompt"
 
 # Groq client — single instance
 _groq_client: Groq = Groq(api_key=GROQ_API_KEY)
@@ -212,9 +212,9 @@ def run_agent(user_query: str, stream: bool = True) -> str:
             messages            = messages,
             tools               = TOOL_SCHEMAS,
             tool_choice         = "auto",
-            temperature         = 1,
+            temperature         = 0.5,
             max_completion_tokens = 8192,
-            top_p               = 1,
+            top_p               = 0.7,
             reasoning_effort    = "medium",
             stream              = False,    # stream=False during tool-call phase
         )

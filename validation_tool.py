@@ -312,7 +312,7 @@ def get_server_boot_time(server_name: str) -> str:
         else:
             session = winrm.Session(
                 server_name,
-                auth=("azure-server\subhayan", WINRM_PASSWORD),
+                auth=("azure-server\\subhayan", WINRM_PASSWORD),
                 transport=WINRM_TRANSPORT,
             )
         
