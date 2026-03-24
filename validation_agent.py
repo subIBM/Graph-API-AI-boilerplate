@@ -20,7 +20,7 @@ import json
 import logging
 import os
 import time
-
+from pathlib import Path
 from dotenv import load_dotenv
 from groq import Groq
 
@@ -36,6 +36,8 @@ TOOL_CALL_DELAY_SECONDS: int = int(os.environ.get("TOOL_CALL_DELAY", "1"))
 
 GROQ_API_KEY: str = os.environ["GROQ_API_KEY"]
 GPT_MODEL:    str = os.environ.get("GPT_MODEL", "openai/gpt-oss-120b")
+
+PROMPTS_DIR  : Path = Path(__file__).parent / "prompts" / "Validation Prompt"
 
 # Groq client — single instance
 _groq_client: Groq = Groq(api_key=GROQ_API_KEY)
@@ -78,6 +80,81 @@ PREDEFINED_PROMPTS: dict[str, str] = {
         "Application Team Validation Status column."
     ),
 }
+
+def _load_prompt(filename: str) -> str:
+    """
+    Read a prompt file from the prompts/ directory.
+
+    Args:
+        filename: File name (e.g. 'system_prompt.txt').
+
+    Returns:
+        File contents as a stripped string.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+    """
+    path = PROMPTS_DIR / filename
+    if not path.exists():
+        raise FileNotFoundError(f"Prompt file not found: {path}")
+    content = path.read_text(encoding="utf-8").strip()
+    logger.debug("Loaded prompt: %s (%d chars)", filename, len(content))
+    return content
+
+
+def load_prompts() -> dict[str, str]:
+    """
+    Load all prompt files and return them as a dict.
+
+    Returns:
+        {
+            "system":    contents of system_prompt.txt,
+            "developer": contents of developer_prompt.txt,
+            "response":  contents of response_prompt.txt,
+        }
+    """
+    prompts = {
+        "system":    _load_prompt("system_prompt"),
+        "developer": _load_prompt("developer_prompt"),
+        "response":  _load_prompt("response_prompt"),
+    }
+    logger.info("All prompts loaded successfully.")
+    return prompts
+
+
+def reload_prompts() -> dict[str, str]:
+    """
+    Hot-reload all prompts from disk without restarting the process.
+    Useful during prompt tuning or called from an admin endpoint.
+
+    Returns:
+        Fresh prompt dict.
+    """
+    logger.info("Hot-reloading prompts…")
+    global _PROMPTS
+    _PROMPTS = load_prompts()
+    return _PROMPTS
+
+
+# Load prompts once at module import time
+_PROMPTS: dict[str, str] = load_prompts()
+
+
+
+def _build_system_message() -> str:
+    """
+    Combine system, developer, and response prompts into a single
+    system message string for the Groq API.
+
+    Returns:
+        Combined prompt string.
+    """
+    return "\n\n---\n\n".join([
+        _PROMPTS["system"],
+        _PROMPTS["developer"],
+        _PROMPTS["response"],
+    ])
+
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +234,7 @@ def run_agent(user_query: str, stream: bool = True) -> str:
     logger.info("User: %s", user_query)
 
     messages: list[dict] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": _build_system_message()},
         {"role": "user",   "content": user_query},
     ]
 
@@ -207,6 +284,24 @@ def run_agent(user_query: str, stream: bool = True) -> str:
                 args = {}
 
             result = _dispatch_tool_call(tc.function.name, args)
+
+                 # for tc in tool_calls:
+        #     try:
+        #         arg_str = tc.function.arguments or "{}"
+        #         if isinstance(arg_str, str):
+        #             arg_str = arg_str.strip()
+        #             if not arg_str:
+        #                 arg_str = "{}"
+        #         args = json.loads(arg_str)
+        #         if not isinstance(args, dict):
+        #             args = {}
+        #         args = {k: v for k, v in args.items() if isinstance(k, str) and k.strip()}
+        #     except json.JSONDecodeError as e:
+        #         logger.warning("Failed to parse arguments for %s: %s", 
+        #                     tc.function.name, tc.function.arguments)
+        #         args = {}
+
+        #     result = _dispatch_tool_call(tc.function.name, args)
 
             messages.append({
                 "role":         "tool",

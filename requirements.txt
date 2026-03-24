@@ -8,3 +8,4 @@ flask
 apscheduler
 pytz
 tzlocal
+pywinrm

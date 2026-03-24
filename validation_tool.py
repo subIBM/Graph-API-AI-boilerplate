@@ -48,8 +48,13 @@ from dotenv import load_dotenv
 
 import threading
 import random
+import winrm
+import logging
+import time
 
 load_dotenv()
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # 1. Configuration
@@ -249,25 +254,168 @@ def get_lyric_servers_ready_for_validation() -> str:
         return json.dumps({"error": str(e)})
 
 
+# def get_server_boot_time(server_name: str) -> str:
+#     """
+#     Connect to *server_name* via WinRM and retrieve the last boot time.
+#     Simulates random success/failure per server call.
+#     """
+#     connection_success = random.choice([True, False])
+
+#     if connection_success:
+#         return json.dumps({
+#             "server":    server_name,
+#             "boot_time": "2026-03-12 15:42:05",
+#             "error":     None,
+#         })
+#     else:
+#         return json.dumps({
+#             "server":    server_name,
+#             "boot_time": None,
+#             "error":     "Could not connect to server",
+#         })
+
 def get_server_boot_time(server_name: str) -> str:
     """
     Connect to *server_name* via WinRM and retrieve the last boot time.
-    Simulates random success/failure per server call.
+    
+    Args:
+        server_name: Hostname or IP address of the Windows server
+    
+    Returns:
+        JSON string with server, boot_time, and error fields
+        Format: {"server": "...", "boot_time": "YYYY-MM-DD HH:MM:SS", "error": null/str}
+    
+    Reads WinRM credentials from environment variables:
+        - WINRM_USER
+        - WINRM_PASSWORD
+        - WINRM_TRANSPORT (default: ntlm)
     """
-    connection_success = random.choice([True, False])
-
-    if connection_success:
+    
+    try:
+        time.sleep(5)
+        if not WINRM_USER or not WINRM_PASSWORD:
+            logger.error(f"{server_name}: WINRM_USER or WINRM_PASSWORD not set in environment")
+            return json.dumps({
+                "server": server_name,
+                "boot_time": None,
+                "error": "WinRM credentials not configured (WINRM_USER, WINRM_PASSWORD)",
+            })
+        
+        logger.info(f"Connecting to {server_name}...")
+        if "cranckb" in server_name:
+            # Create WinRM session using winrm.Session
+            session = winrm.Session(
+                server_name,
+                auth=(WINRM_USER, WINRM_PASSWORD),
+                transport=WINRM_TRANSPORT,
+            )
+        else:
+            session = winrm.Session(
+                server_name,
+                auth=("azure-server\\subhayan", WINRM_PASSWORD),
+                transport=WINRM_TRANSPORT,
+            )
+        
+        # Run PowerShell command to get boot time and computer name
+        ps_cmd = (
+            "(Get-CimInstance -ClassName Win32_OperatingSystem | "
+            "ForEach-Object { $_.CSName + ' ' + $_.LastBootUpTime })"
+        )
+        
+        response = session.run_ps(ps_cmd)
+        
+        # Check for command execution errors
+        if response.status_code != 0:
+            error_msg = response.std_err.decode("utf-8", errors="ignore").strip()
+            if not error_msg:
+                error_msg = "Unknown error"
+            logger.warning(f"PowerShell error on {server_name}: {error_msg}")
+            return json.dumps({
+                "server": server_name,
+                "boot_time": None,
+                "error": f"PowerShell command failed: {error_msg}",
+            })
+        
+        # Parse output: format is "COMPUTERNAME 3/12/2026 3:42:05 PM"
+        output = response.std_out.decode("utf-8", errors="ignore").strip()
+        
+        if not output:
+            logger.warning(f"{server_name}: No output from PowerShell command")
+            return json.dumps({
+                "server": server_name,
+                "boot_time": None,
+                "error": "No output from PowerShell command",
+            })
+        
+        # Split output: first part is computer name, rest is the datetime
+        parts = output.split(maxsplit=1)
+        if len(parts) < 2:
+            logger.warning(f"{server_name}: Invalid output format: {output}")
+            return json.dumps({
+                "server": server_name,
+                "boot_time": None,
+                "error": f"Invalid output format: {output}",
+            })
+        
+        # Extract boot time (second part onwards)
+        boot_time_str = parts[1].strip()
+        
+        # Parse the boot time from Windows format (e.g., "3/12/2026 3:42:05 PM")
+        # Try multiple formats
+        boot_dt = None
+        for fmt in ("%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                boot_dt = datetime.strptime(boot_time_str, fmt)
+                break
+            except ValueError:
+                continue
+        
+        if boot_dt is None:
+            logger.warning(f"{server_name}: Could not parse boot time: {boot_time_str}")
+            return json.dumps({
+                "server": server_name,
+                "boot_time": None,
+                "error": f"Could not parse boot time format: {boot_time_str}",
+            })
+        
+        # Format to standardized format: YYYY-MM-DD HH:MM:SS
+        formatted_boot_time = boot_dt.strftime("%Y-%m-%d %H:%M:%S")
+        
+        logger.info(f" {server_name}: boot time = {formatted_boot_time}")
+        
         return json.dumps({
-            "server":    server_name,
-            "boot_time": "2026-03-12 15:42:05",
-            "error":     None,
+            "server": server_name,
+            "boot_time": formatted_boot_time,
+            "error": None,
         })
-    else:
+    
+    except TimeoutError:
+        error_msg = f"Connection timeout to {server_name}"
+        logger.error(error_msg)
         return json.dumps({
-            "server":    server_name,
+            "server": server_name,
             "boot_time": None,
-            "error":     "Could not connect to server",
+            "error": "Could not connect to server",
         })
+    
+    except ConnectionError as e:
+        error_msg = f"Connection refused: {str(e)}"
+        logger.error(f"{server_name}: {error_msg}")
+        return json.dumps({
+            "server": server_name,
+            "boot_time": None,
+            "error": "Could not connect to server",
+        })
+    
+    except Exception as e:
+        error_msg = f"WinRM error: {str(e)}"
+        logger.error(f"{server_name}: {error_msg}")
+        return json.dumps({
+            "server": server_name,
+            "boot_time": None,
+            "error": "Could not connect to server",
+        })
+ 
 
 
 def update_boot_time_in_excel(
