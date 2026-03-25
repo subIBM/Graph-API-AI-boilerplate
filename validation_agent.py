@@ -317,9 +317,9 @@ def run_agent(user_query: str, stream: bool = True) -> str:
             messages              = messages,
             tools                 = TOOL_SCHEMAS,
             tool_choice           = "auto",   
-            temperature           = 0.7,
+            temperature           = 1,
             max_completion_tokens = 8192,
-            top_p                 = 0.5,
+            top_p                 = 1,
             reasoning_effort      = "medium",
             stream                = True,
         )
